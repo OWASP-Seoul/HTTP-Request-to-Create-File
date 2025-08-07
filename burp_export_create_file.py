@@ -1,14 +1,10 @@
 #!/usr/bin/env python3
-# burp_export_create_file.py
 """
-Decode Burp Suite XML export:
-• Base64-decoded responses are written out mirroring URL paths.
-• MIME type is inferred (mimetype tag → header → python-magic → body sniff).
-• If the URL has no extension, assign a unique file name in the format file_MD5(query).ext.
-• Compress the resulting folder into a ZIP file.
+Description:
+• Parses the response data from an XML file exported from Burp Suite and saves it as a raw file.
 
 Usage:
-• python burp_export_create_file.py <input_file.xml>
+• python burp_export_create_file.py <export_file.xml>
 """
 
 from __future__ import annotations
@@ -36,6 +32,7 @@ MIME_EXT = {
     "text/plain": ".txt", "txt": ".txt",
     "image/jpeg": ".jpg", "image/png": ".png", "image/gif": ".gif",
     "image/svg+xml": ".svg",
+    "text": ".txt",
 }
 
 # ── MIME 추론 ────────────────────────────────────────
@@ -51,16 +48,16 @@ def guess_mime(body: bytes) -> str:
     return "text/plain"
 
 def extract_ct(resp: bytes) -> str:
-    for line in resp.split(b"\r\n\r\n",1)[0].splitlines():
+    for line in resp.split(b"\r\n\r\n", 1)[0].splitlines():
         if line.lower().startswith(b"content-type:"):
-            return line.decode(errors="ignore").split(":",1)[1].split(";",1)[0].strip().lower()
+            return line.decode(errors="ignore").split(":", 1)[1].split(";", 1)[0].strip().lower()
     return ""
 
 # ── 파일 경로 결정 ───────────────────────────────────
-def make_filepath(url:str, mime:str, out_dir:Path)->Tuple[Path,bool]:
+def make_filepath(url: str, mime: str, out_dir: Path) -> Tuple[Path, bool]:
     p = urllib.parse.urlparse(url)
     upath = Path(p.path.lstrip("/"))
-    parent = upath.parent if upath.parent!=Path(".") else Path()
+    parent = upath.parent if upath.parent != Path(".") else Path()
     if upath.suffix:                                  # 이미 확장자 O
         filename = upath.name
     else:                                             # 확장자 부여
@@ -74,89 +71,129 @@ def make_filepath(url:str, mime:str, out_dir:Path)->Tuple[Path,bool]:
     return dest, dest.exists()
 
 # ── 진행률 & 메시지 ───────────────────────────────────
-def log(msg:str, idx:int, tot:int)->None:
-    prog = f"{CYN}{idx}/{tot}{CLR}  ({idx/tot*100:5.1f}%)"
-    sys.stdout.write("\r"+" "*120+"\r")   # 진행줄 clear
-    sys.stdout.write(f"{msg}\n")          # 결과 메시지 고정
-    sys.stdout.write(f"\r{prog}")         # 진행률 → 마지막 줄
+def log(msg: str, idx: int, tot: int) -> None:
+    prog = f"{CYN}{idx}/{tot}{CLR}  ({idx / tot * 100:5.1f}%)"
+    sys.stdout.write("\r" + " " * 120 + "\r")   # 진행줄 clear
+    sys.stdout.write(f"{msg}\n")                # 결과 메시지 고정
+    sys.stdout.write(f"\r{prog}")               # 진행률 → 마지막 줄
     sys.stdout.flush()
 
+# ── Summary 출력 ─────────────────────────────────────
+def print_summary(tot: int, succ: int, skip: int, fail: int,
+                  out_dir: Path, zip_name: Path) -> None:
+    sys.stdout.write("\n\n")  # 진행률 줄 고정
+    print(f"{CYN}{'─' * 8}  Summary {'─' * 8}{CLR}")
+    print(f"Total     : {tot}")
+    print(f"{GRN}Success   : {succ}{CLR}")
+    print(f"{YEL}Skipped   : {skip}{CLR}")
+    print(f"{RED}Failures  : {fail}{CLR}")
+    print(f"Output dir: {out_dir}\n")
+
 # ── 메인 ─────────────────────────────────────────────
-def main()->None:
-    if len(sys.argv)!=2:
-        print("Usage: python burp_export_create_file.py <export.xml>"); return
+def main() -> None:
+    if len(sys.argv) != 2:
+        print("Usage: python burp_export_create_file.py <export.xml>")
+        return
     in_xml = Path(sys.argv[1]).resolve()
     if not in_xml.is_file():
-        print(f"{RED}[!] File not found:{CLR} {in_xml}"); return
+        print(f"{RED}[!] File not found:{CLR} {in_xml}")
+        return
 
     out_dir = in_xml.with_name(in_xml.stem + "_decoded")
-    zip_name= out_dir.with_suffix(".zip")
+    zip_name = out_dir.with_suffix(".zip")
     out_dir.mkdir(exist_ok=True)
 
     items = ET.parse(in_xml).getroot().findall("item")
     tot = len(items)
-    succ=fail=skip=0
-    fails: list[str]=[]
+    succ = fail = skip = 0
+    fails: list[str] = []
 
-    log(f"{CYN}[i] Processing {tot} files…{CLR}",0,tot)
+    log(f"{CYN}[i] Processing {tot} files…{CLR}", 0, tot)
 
-    for idx,it in enumerate(items,1):
-        url  = it.findtext("url","").strip()
+    for idx, it in enumerate(items, 1):
+        url = it.findtext("url", "").strip()
         resp = it.find("response")
         mime = (it.findtext("mimetype") or "").strip().lower()
 
         msg_prefix = f"[{idx:>3}/{tot}] "
 
-        if not url or resp is None or resp.attrib.get("base64")!="true":
-            fail+=1; fails.append(url or "<no-url>")
-            log(f"{msg_prefix}{RED}[✗] invalid        {CLR}→ {url}",idx,tot); continue
+        if not url or resp is None or resp.attrib.get("base64") != "true":
+            fail += 1
+            fails.append(url or "<no-url>")
+            log(f"{msg_prefix}{RED}[✗] invalid           {CLR}→ {url}", idx, tot)
+            continue
 
         try:
             raw = base64.b64decode(resp.text or "", validate=False)
         except Exception:
-            fail+=1; fails.append(url)
-            log(f"{msg_prefix}{RED}[✗] b64-error      {CLR}→ {url}",idx,tot); continue
+            fail += 1
+            fails.append(url)
+            log(f"{msg_prefix}{RED}[✗] b64-error         {CLR}→ {url}", idx, tot)
+            continue
 
-        body = raw.split(b"\r\n\r\n",1)[-1]
+        body = raw.split(b"\r\n\r\n", 1)[-1]
         mime = mime or extract_ct(raw) or guess_mime(body)
-        dest, exists = make_filepath(url,mime,out_dir)
+        dest, exists = make_filepath(url, mime, out_dir)
 
         if exists:
-            skip+=1
-            log(f"{msg_prefix}{YEL}[→] {mime:<10}{CLR}→ {YEL}(skip) {CLR}{dest.relative_to(out_dir)}",
-                idx,tot); continue
+            skip += 1
+            log(
+                f"{msg_prefix}{YEL}[→] {mime:<20}{CLR}→ {YEL}(Skipped) {CLR}{dest.relative_to(out_dir)}",
+                idx,
+                tot,
+            )
+            continue
 
         dest.parent.mkdir(parents=True, exist_ok=True)
         try:
             dest.write_bytes(body)
-            succ+=1
-            log(f"{msg_prefix}{GRN}[✔] {mime:<14}{CLR}→ {dest.relative_to(out_dir)}",
-                idx,tot)
+            succ += 1
+            log(
+                f"{msg_prefix}{GRN}[✔] {mime:<20}{CLR}→ {GRN}(Success) {CLR}{dest.relative_to(out_dir)}",
+                idx,
+                tot,
+            )
         except Exception:
-            fail+=1; fails.append(url)
-            log(f"{msg_prefix}{RED}[✗] write-err     {CLR}→ {url}",idx,tot)
+            fail += 1
+            fails.append(url)
+            log(f"{msg_prefix}{RED}[✗] write-err         {CLR}→ {url}", idx, tot)
 
-    # ZIP
-    with zipfile.ZipFile(zip_name,"w",zipfile.ZIP_DEFLATED) as zf:
-        for fp in out_dir.rglob("*"):
-            if fp.is_file():
-                try: zf.write(fp, fp.relative_to(out_dir))
-                except ValueError: pass
+    # ── Summary 먼저 ─────────────────────────────────────
+    print_summary(tot, succ, skip, fail, out_dir, zip_name)
 
-    sys.stdout.write("\n")   # 진행줄 끝줄 고정
+    # ── ZIP 압축 (진행률 표시 + 현재 파일명) ───────────────────────────
+    files = [fp for fp in out_dir.rglob("*") if fp.is_file()]
+    ztot  = len(files)
 
-    # Summary
-    print(f"{CYN}{'─'*8} Summary {'─'*8}{CLR}")
-    print(f"Total     : {tot}")
-    print(f"{GRN}Success   : {succ}{CLR}")
-    print(f"{YEL}Skipped   : {skip}{CLR}")
-    print(f"{RED}Failures  : {fail}{CLR}")
-    print(f"Output dir: {out_dir}")
+    if ztot == 0:
+        print(f"{YEL}[!] No files to zip.{CLR}")
+    else:
+        print(f"{CYN}{'─' * 8}  Compressing to ZIP ({ztot} files) {'─' * 8}{CLR}")
+        max_disp = 60                             # 파일명 표시 폭
+        with zipfile.ZipFile(zip_name, "w", zipfile.ZIP_DEFLATED) as zf:
+            for zi, fp in enumerate(files, 1):
+                zf.write(fp, fp.relative_to(out_dir))
+
+                # ── ① 진행률 계산
+                prog = f"{zi}/{ztot} ({zi / ztot * 100:5.1f}%)"
+
+                # ── ② 표시용 파일 경로(너무 길면 뒤쪽만 남기고 …)
+                rel = str(fp.relative_to(out_dir))
+                disp = rel if len(rel) <= max_disp else "…" + rel[-(max_disp - 1):]
+
+                # ── ③ 한 줄에 진행률 + 파일명 출력
+                sys.stdout.write(
+                    f"\r[ZIP] {prog:<18} {disp:<{max_disp}}"
+                )
+                sys.stdout.flush()
+
+        sys.stdout.write("\r[ZIP] Done. " + " " * (max_disp + 20) + "\n")
     print(f"ZIP file  : {zip_name}")
 
+    # ── 실패 로그 ────────────────────────────────────────
     if fails:
-        flog = out_dir/"failures.log"
-        flog.write_text("\n".join(fails),encoding="utf-8")
+        flog = out_dir / "failures.log"
+        flog.write_text("\n".join(fails), encoding="utf-8")
         print(f"{RED}[!] Failure log → {flog}{CLR}")
 
 if __name__ == "__main__":
