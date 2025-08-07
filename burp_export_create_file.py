@@ -138,7 +138,7 @@ def main() -> None:
         if exists:
             skip += 1
             log(
-                f"{msg_prefix}{YEL}[→] {mime:<20}{CLR}→ {YEL}(Skipped) {CLR}{dest.relative_to(out_dir)}",
+                f"{msg_prefix}{YEL}[〃] {mime:<20}{CLR}→ {YEL}(Skipped) {CLR}{dest.relative_to(out_dir)}",
                 idx,
                 tot,
             )
