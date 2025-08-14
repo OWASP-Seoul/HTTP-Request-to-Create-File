@@ -8,13 +8,11 @@ Decode OWASP ZAP HAR export (2xx-only):
 • URL 경로의 퍼센트 인코딩을 디코딩하고, 세그먼트별 sanitize + Unicode NFC 정규화.
 • MIME → 확장자 부여(본문 시그니처 스니핑 포함), URL 무확장 시 query-MD5 유일화.
 • Summary 출력 후 ZIP 압축(진행률 + 현재 파일명 표시).
-
-Usage:
-    python zap_har_export_create_file.py <input.har>
+• NEW: 성공한 항목의 url, referer, saved_rel을 url_map.csv로 저장(UTF-8 with BOM).
 """
 
 from __future__ import annotations
-import sys, json, base64, hashlib, zipfile, urllib.parse, re, unicodedata
+import sys, json, base64, hashlib, zipfile, urllib.parse, re, unicodedata, csv, io
 from pathlib import Path
 from typing import Tuple
 from urllib.parse import urlsplit, urlunsplit, unquote
@@ -28,35 +26,98 @@ try:
 except ImportError:
     CLR = GRN = YEL = RED = CYN = ""
 
-# ── MIME ↔ 확장자 매핑
+# ── 안전/위험 확장자 정책
+SAFE_EXTS = {
+    # Office / 문서 / 데이터
+    "txt","csv","json","xml","pdf",
+    "xlsx","xls","docx","doc","pptx","ppt",
+    # 웹/이미지/압축
+    "html","htm","css","js","png","jpg","jpeg","gif","webp","svg","zip"
+}
+DANGEROUS_EXTS = {"exe","dll","com","bat","cmd","msi","vbs","ps1","sh"}
+
+# ── MIME ↔ 확장자 매핑(헤더 또는 스니핑 결과용)
 MIME_EXT = {
+    # 웹
     "text/html": ".html", "html": ".html",
     "text/css": ".css",   "css": ".css",
     "application/javascript": ".js", "text/javascript": ".js",
     "script": ".js", "js": ".js",
     "application/json": ".json", "json": ".json",
     "text/plain": ".txt", "txt": ".txt",
-    "image/jpeg": ".jpg", "image/png": ".png", "image/gif": ".gif",
-    "image/svg+xml": ".svg",
+    # 이미지
+    "image/jpeg": ".jpg", "image/jpg": ".jpg",
+    "image/png": ".png", "image/gif": ".gif",
+    "image/svg+xml": ".svg", "image/webp": ".webp",
+    # 문서
     "application/pdf": ".pdf",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation": ".pptx",
+    "application/msword": ".doc",
+    "application/vnd.ms-excel": ".xls",
+    "application/vnd.ms-powerpoint": ".ppt",
+    # 압축/바이너리
+    "application/zip": ".zip",
+    "application/octet-stream": "",  # 스니핑/보정 대상
     "text": ".txt",
 }
 
-# ── MIME 추론(본문 시그니처 스니핑)
+# ── 본문 시그니처 스니핑: MIME/확장자 추론
+def sniff_ext_from_bytes(b: bytes) -> tuple[str|None, str|None]:
+    """
+    Returns (mime, ext) if confidently detected, else (None, None)
+    """
+    # ZIP(OpenXML: xlsx/docx/pptx 등)
+    if b[:4] == b'PK\x03\x04':
+        try:
+            with zipfile.ZipFile(io.BytesIO(b)) as zf:
+                names = zf.namelist()
+            if any(n.startswith('xl/') for n in names):
+                return ("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", ".xlsx")
+            if any(n.startswith('word/') for n in names):
+                return ("application/vnd.openxmlformats-officedocument.wordprocessingml.document", ".docx")
+            if any(n.startswith('ppt/') for n in names):
+                return ("application/vnd.openxmlformats-officedocument.presentationml.presentation", ".pptx")
+            return ("application/zip", ".zip")
+        except zipfile.BadZipFile:
+            # 헤더는 ZIP인데 손상 — 그래도 zip으로 취급
+            return ("application/zip", ".zip")
+
+    # OLE CFB (구형 Office)
+    if b.startswith(b'\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1'):
+        # 세부 구분은 어렵지만 xls/doc/ppt 가능성 — 가장 안전한 xls로
+        return ("application/vnd.ms-excel", ".xls")
+
+    # PDF
+    if b.startswith(b"%PDF-"):
+        return ("application/pdf", ".pdf")
+
+    # PNG/JPG/GIF/WEBP
+    if b.startswith(b"\x89PNG\r\n\x1a\n"): return ("image/png", ".png")
+    if b[0:3] == b'\xff\xd8\xff':         return ("image/jpeg", ".jpg")
+    if b.startswith(b"GIF8"):             return ("image/gif", ".gif")
+    if b.startswith(b"RIFF") and b[8:12] == b"WEBP": return ("image/webp", ".webp")
+
+    # HTML / JSON / JS / CSS (간단 휴리스틱)
+    h = b[:256].lstrip().lower()
+    if h.startswith(b"<!doctype") or b"<html" in h: return ("text/html", ".html")
+    if h.startswith(b"{") or h.startswith(b"["):     return ("application/json", ".json")
+    if b"function(" in h or b"var " in h:            return ("application/javascript", ".js")
+    if b"{font" in h or b"body{" in h:               return ("text/css", ".css")
+
+    return (None, None)
+
+# ── 간단 MIME 휴리스틱(헤더 비었을 때만)
 def guess_mime(body: bytes) -> str:
-    if body.startswith(b"%PDF-"):                        # PDF 헤더
-        return "application/pdf"
+    mime, _ = sniff_ext_from_bytes(body)
+    if mime:
+        return mime
     h = body[:200].lower()
     if h.startswith(b"<!doctype") or b"<html" in h:
         return "text/html"
     if h.startswith(b"{") or h.startswith(b"["):
         return "application/json"
-    if h.startswith(b"\xff\xd8"):
-        return "image/jpeg"
-    if h.startswith(b"\x89png"):
-        return "image/png"
-    if h.startswith(b"gif8"):
-        return "image/gif"
     if b"function(" in h or b"var " in h:
         return "application/javascript"
     if b"body{" in h or b"{font" in h:
@@ -67,26 +128,41 @@ def guess_mime(body: bytes) -> str:
 _ILLEGAL = r'<>:"/\\|?*\x00-\x1F'
 _ILLEGAL_RE = re.compile(f"[{re.escape(_ILLEGAL)}]")
 
-def sanitize_filename(name: str) -> str:
-    # OS 위험 문자 제거 및 길이 제한
-    name = name.strip().replace("\u202e", "")  # RTL override 방지
-    name = _ILLEGAL_RE.sub("_", name)
-    return name[:255] or "file"
+def _nfc(s: str) -> str:
+    try:
+        return unicodedata.normalize("NFC", s)
+    except Exception:
+        return s
+
+def sanitize_component(s: str) -> str:
+    # 경로 세그먼트 및 파일명 공통 정리
+    s = s.strip().replace("\u202e", "")  # RTL override 제거
+    s = _ILLEGAL_RE.sub("_", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    # Windows 예약 이름 회피
+    reserved = {"con","prn","aux","nul","com1","com2","com3","com4","com5","com6","com7","com8","com9",
+                "lpt1","lpt2","lpt3","lpt4","lpt5","lpt6","lpt7","lpt8","lpt9"}
+    if s.lower() in reserved:
+        s = s + "_"
+    return s[:255] or "file"
+
+def sanitize_filename_keep_ext(name: str) -> str:
+    name = _nfc(sanitize_component(name))
+    if "." in name:
+        base, ext = name.rsplit(".", 1)
+        base = sanitize_component(base).rstrip(" .")
+        ext  = sanitize_component(ext).lower()
+        return f"{base}.{ext}" if ext else base
+    else:
+        return sanitize_component(name)
 
 def get_cd_filename(headers: list[dict]) -> str | None:
-    """
-    HAR entry.response.headers (list of {name,value})에서
-    Content-Disposition을 찾아 filename*/filename을 파싱.
-    RFC 6266에 따라 filename* 우선.
-    """
     if not headers:
         return None
     cd = next((h.get("value") for h in headers
                if h.get("name","").lower() == "content-disposition"), None)
     if not cd:
         return None
-
-    # 파라미터 파싱
     parts = [p.strip() for p in cd.split(";")]
     params: dict[str, str] = {}
     for p in parts[1:]:
@@ -94,53 +170,47 @@ def get_cd_filename(headers: list[dict]) -> str | None:
             k, v = p.split("=", 1)
             params[k.strip().lower()] = v.strip().strip('"')
 
-    # RFC 5987: filename*=charset''percent-encoded
     fn_star = params.get("filename*")
     if fn_star:
         try:
             if "'" in fn_star:
                 charset, _lang, enc_value = fn_star.split("'", 2)
                 raw = urllib.parse.unquote_to_bytes(enc_value)
-                return sanitize_filename(raw.decode(charset or "utf-8", "replace"))
+                decoded = raw.decode(charset or "utf-8", "replace")
+                print("CD decoded(*) =>", decoded)  # ★ 디버그1
+                sanitized = sanitize_filename_keep_ext(decoded)
+                print("After sanitize(*) =>", sanitized)  # ★ 디버그2
+                return sanitized
         except Exception:
             pass
 
-    # 전통적인 filename=
     fn = params.get("filename")
     if fn:
         try:
             fn = urllib.parse.unquote(fn)
         except Exception:
             pass
-        return sanitize_filename(fn)
+        print("CD decoded =>", fn)  # ★ 디버그1
+        sanitized = sanitize_filename_keep_ext(fn)
+        print("After sanitize =>", sanitized)  # ★ 디버그2
+        return sanitized
     return None
 
-# ── 경로 디코딩 + 정규화 + 세그먼트별 sanitize
-def _nfc(s: str) -> str:
-    try:
-        return unicodedata.normalize("NFC", s)
-    except Exception:
-        return s
 
+# ── 경로 디코딩 + 정규화 + 세그먼트별 sanitize
 def _decode_and_sanitize_path(path: str) -> tuple[Path, str]:
-    # 1) percent-decode → 2) 앞의 / 제거 → 3) ., .. 제거
-    # 4) 세그먼트별 sanitize → 5) Unicode NFC 정규화
     raw = urllib.parse.unquote(path or "")
     raw = raw.lstrip("/")
     parts = [seg for seg in raw.split("/") if seg not in ("", ".", "..")]
-    parts = [_nfc(sanitize_filename(seg)) for seg in parts]
+    parts = [_nfc(sanitize_component(seg)) for seg in parts]
     parent = Path(*parts[:-1]) if len(parts) > 1 else Path()
     leaf = parts[-1] if parts else ""
     return parent, leaf
 
 # ── 표시용(URL 로그용) 디코딩: 경로/쿼리/프래그먼트만 percent-decode
-def format_url_for_log(u: str) -> str:
-    """
-    로그/에러 메시지에 사람이 읽기 좋은 URL을 보여주기 위한 포매터.
-    - path/query/fragment만 percent-decode (UTF-8, errors='replace')
-    - netloc(도메인)은 그대로 둠(처리에 영향 없도록)
-    주의: 예약문자 디코딩은 해석을 바꿀 수 있으므로 실제 처리에는 raw URL을 유지.
-    """
+def format_url_for_log(u: str | None) -> str:
+    if not u:
+        return ""
     try:
         p = urlsplit(u)
         path = unquote(p.path, encoding="utf-8", errors="replace")
@@ -151,23 +221,70 @@ def format_url_for_log(u: str) -> str:
         try:
             return unquote(u, encoding="utf-8", errors="replace")
         except Exception:
-            return u
+            return u or ""
 
-# ── URL 기반 파일 경로 결정
+# ── URL 기반 파일 경로(초안) 결정: 확장자 보정은 나중에 수행
 def make_filepath(url: str, mime: str, out_dir: Path) -> Tuple[Path, bool]:
     p = urllib.parse.urlparse(url)
     parent, leaf = _decode_and_sanitize_path(p.path)
+
     if leaf and Path(leaf).suffix:
-        filename = leaf
+        filename = sanitize_filename_keep_ext(leaf)
     else:
-        ext = MIME_EXT.get(mime) or (f".{mime}" if mime and "/" not in mime else ".bin")
+        # 헤더 MIME이 있으면 우선, 없으면 text/plain 등
+        ext = MIME_EXT.get(mime, "")
+        if not ext:
+            # 모호할 때 임시 확장자 — 이후 스니핑 단계에서 교체
+            ext = ".bin" if "/" in mime or not mime else f".{mime}"
         stem = Path(leaf).stem or "index"
         if p.query:
             md5 = hashlib.md5(p.query.encode()).hexdigest()
             stem = f"{stem}_{md5}"
-        filename = stem + ext
+        filename = sanitize_filename_keep_ext(stem + ext)
+
     dest = out_dir / parent / filename
     return dest, dest.exists()
+
+# ── 최종 파일명 결정: CD/URL 이름 + 스니핑/헤더로 확장자 보정
+def decide_final_name(raw_name: str, body: bytes, header_mime: str | None) -> tuple[str, str]:
+    """
+    Returns (final_name, final_mime)
+    """
+    name = sanitize_filename_keep_ext(raw_name)
+    sniff_mime, sniff_ext = sniff_ext_from_bytes(body)
+
+    # 1) 스니핑이 확실하면 스니핑 우선
+    if sniff_mime and sniff_ext:
+        final_mime = sniff_mime
+        if "." in name:
+            base, _ = name.rsplit(".", 1)
+            name = f"{base}{sniff_ext}"
+        else:
+            name = f"{name}{sniff_ext}"
+        return name, final_mime
+
+    # 2) 스니핑 실패 시 헤더 MIME으로 보정
+    final_mime = (header_mime or "").lower()
+    ext_from_mime = MIME_EXT.get(final_mime, "")
+    if ext_from_mime:
+        if "." in name:
+            base, _old = name.rsplit(".", 1)
+            # 이미 동일 확장자면 유지, 다르면 교체
+            if not name.lower().endswith(ext_from_mime):
+                name = f"{base}{ext_from_mime}"
+        else:
+            name = f"{name}{ext_from_mime}"
+    else:
+        # 헤더도 모호하면 확장자 유지(또는 미지정)
+        pass
+
+    # 3) 위험 확장자 중립화 (Office/PDF/이미지는 제외됨)
+    if "." in name:
+        ext = name.rsplit(".", 1)[1].lower()
+        if ext in DANGEROUS_EXTS:
+            name = name + ".download"
+
+    return name, final_mime or "application/octet-stream"
 
 # ── 진행률/로그 출력
 def log(msg: str, idx: int, tot: int) -> None:
@@ -181,7 +298,7 @@ def log(msg: str, idx: int, tot: int) -> None:
 
 # ── Summary 출력 (2xx 필터링 정보 포함)
 def print_summary(total_all: int, total_2xx: int, succ: int, skip: int, fail: int,
-                  filtered_non2xx: int, out_dir: Path, zip_name: Path) -> None:
+                  filtered_non2xx: int, out_dir: Path, zip_name: Path, url_map_csv: Path) -> None:
     sys.stdout.write("\n\n")
     print(f"{CYN}{'─'*8}  Summary {'─'*8}{CLR}")
     print(f"Total entries  : {total_all}")
@@ -190,7 +307,8 @@ def print_summary(total_all: int, total_2xx: int, succ: int, skip: int, fail: in
     print(f"{GRN}Success        : {succ}{CLR}")
     print(f"{YEL}Skipped        : {skip}{CLR}")
     print(f"{RED}Failure        : {fail}{CLR}")
-    print(f"Output dir     : {out_dir}\n")
+    print(f"Output dir     : {out_dir}")
+    print(f"URL map CSV    : {url_map_csv}\n")
 
 # ── HAR entries 추출(표준/조각 JSON 모두 수용)
 def extract_entries(data: dict | list) -> list[dict]:
@@ -201,6 +319,16 @@ def extract_entries(data: dict | list) -> list[dict]:
     if isinstance(data, list) and data and isinstance(data[0], dict) and "response" in data[0]:
         return data
     raise ValueError("HAR 형식이 아님: log.entries / entry 구조를 찾지 못했습니다.")
+
+# ── (NEW) 요청/응답 헤더에서 이름으로 값 추출 (대소문자 무시)
+def _get_header(headers: list[dict] | None, name: str) -> str | None:
+    if not headers:
+        return None
+    lname = name.lower()
+    for h in headers:
+        if (h.get("name") or "").lower() == lname:
+            return h.get("value")
+    return None
 
 # ── 메인
 def main() -> None:
@@ -226,8 +354,7 @@ def main() -> None:
         print(f"{RED}[!] {e}{CLR}")
         return
 
-    # ── 2xx 필터링 (RFC 9110: 200–299은 Successful class) ──
-    # 참고: 2xx는 요청이 성공적으로 수신·이해·수락되었음을 의미. (RFC 9110 §15.3, MDN)
+    # ── 2xx 필터링
     eligible: list[dict] = []
     for ent in entries_all:
         resp = ent.get("response", {}) or {}
@@ -241,17 +368,23 @@ def main() -> None:
 
     succ = fail = skip = 0
     fails: list[str] = []
+    url_map_rows: list[tuple[str, str, str]] = []  # (url_disp, referer_disp, rel)
 
     log(f"{CYN}[i] Processing {tot} entries (2xx only)…{CLR}", 0, tot)
 
     for idx, ent in enumerate(eligible, 1):
-        url_raw  = ent.get("request", {}).get("url", "").strip()
-        url_disp = format_url_for_log(url_raw)  # 로그 출력용 디코딩 URL
+        req = ent.get("request", {}) or {}
+        url_raw   = req.get("url", "").strip()
+        url_disp  = format_url_for_log(url_raw)  # 로그/CSV 표시용
+        req_hdrs  = req.get("headers", [])       # (NEW)
+        ref_raw   = _get_header(req_hdrs, "Referer")
+        ref_disp  = format_url_for_log(ref_raw) if ref_raw else ""
+
         resp = ent.get("response", {})
         cont = resp.get("content", {}) if isinstance(resp, dict) else {}
         raw  = cont.get("text")
         enc  = cont.get("encoding")
-        mime = (cont.get("mimeType") or "").lower().split(";", 1)[0]
+        header_mime = (cont.get("mimeType") or "").lower().split(";", 1)[0]
 
         msg_prefix = f"[{idx:>3}/{tot}] "
 
@@ -275,25 +408,26 @@ def main() -> None:
             log(f"{msg_prefix}{RED}[X] Decode-Error             {CLR}→ {RED}(Failure){CLR} {url_disp}", idx, tot)
             continue
 
-        # MIME 보정
-        mime = mime or guess_mime(body_bytes)
+        # MIME 보정(헤더 비었으면 휴리스틱)
+        eff_mime = header_mime or guess_mime(body_bytes)
 
-        # Content-Disposition 기반 파일명 우선 적용
+        # URL 기반 초안 경로
+        dest, exists = make_filepath(url_raw, eff_mime, out_dir)
+
+        # Content-Disposition 이름 우선 (있다면 URL leaf를 대체)
         cd_name = get_cd_filename(resp.get("headers", []))
-        if cd_name:
-            p = urllib.parse.urlparse(url_raw)
-            parent, _leaf = _decode_and_sanitize_path(p.path)
-            dest = out_dir / parent / cd_name
-            exists = dest.exists()
-        else:
-            # URL 기반 규칙(퍼센트 디코딩 + sanitize + NFC)
-            dest, exists = make_filepath(url_raw, mime, out_dir)
+        raw_name = cd_name if cd_name else dest.name
 
-        if exists:
+        # 최종 파일명 결정: 스니핑/헤더 기반 확장자 보정
+        final_name, final_mime = decide_final_name(raw_name, body_bytes, header_mime or eff_mime)
+        if final_name != dest.name:
+            dest = dest.with_name(final_name)
+
+        if dest.exists():
             skip += 1
             rel = dest.relative_to(out_dir)
             log(
-                f"{msg_prefix}{YEL}[―] {mime:<25}{CLR}→ {YEL}(Skipped){CLR} {rel}",
+                f"{msg_prefix}{YEL}[―] {final_mime:<45}{CLR}→ {YEL}(Skipped){CLR} {rel}",
                 idx, tot
             )
             continue
@@ -303,8 +437,12 @@ def main() -> None:
             dest.write_bytes(body_bytes)
             succ += 1
             rel = dest.relative_to(out_dir)
+
+            # NEW: URL ↔ Referer ↔ 상대경로 매핑 수집
+            url_map_rows.append((url_disp, ref_disp, str(rel)))
+
             log(
-                f"{msg_prefix}{GRN}[v] {mime:<25}{CLR}→ {GRN}(Success){CLR} {rel}",
+                f"{msg_prefix}{GRN}[v] {final_mime:<45}{CLR}→ {GRN}(Success){CLR} {rel}",
                 idx, tot
             )
         except Exception:
@@ -312,8 +450,15 @@ def main() -> None:
             fails.append(url_raw)
             log(f"{msg_prefix}{RED}[X] Create-Failure           {CLR}→ {RED}(Failure){CLR} {url_disp}", idx, tot)
 
+    # NEW: url, referer, saved_rel 매핑 CSV 저장 (UTF-8 with BOM, newline='')
+    url_map_csv = out_dir / "url_map.csv"
+    with url_map_csv.open("w", encoding="utf-8-sig", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["url", "referer", "saved_rel"])
+        w.writerows(url_map_rows)
+
     # Summary (2xx 필터링 정보 포함)
-    print_summary(total_all, tot, succ, skip, fail, filtered_non2xx, out_dir, zip_name)
+    print_summary(total_all, tot, succ, skip, fail, filtered_non2xx, out_dir, zip_name, url_map_csv)
 
     # ZIP 압축 (파일명 표시)
     files = [fp for fp in out_dir.rglob("*") if fp.is_file()]
