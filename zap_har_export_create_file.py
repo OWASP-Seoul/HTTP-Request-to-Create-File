@@ -427,7 +427,7 @@ def main() -> None:
             skip += 1
             rel = dest.relative_to(out_dir)
             log(
-                f"{msg_prefix}{YEL}[―] {final_mime:<45}{CLR}→ {YEL}(Skipped){CLR} {rel}",
+                f"{msg_prefix}{YEL}[-] {final_mime:<25}{CLR}→ {YEL}(Skipped){CLR} {rel}",
                 idx, tot
             )
             continue
@@ -442,7 +442,7 @@ def main() -> None:
             url_map_rows.append((url_disp, ref_disp, str(rel)))
 
             log(
-                f"{msg_prefix}{GRN}[v] {final_mime:<45}{CLR}→ {GRN}(Success){CLR} {rel}",
+                f"{msg_prefix}{GRN}[v] {final_mime:<25}{CLR}→ {GRN}(Success){CLR} {rel}",
                 idx, tot
             )
         except Exception:
@@ -477,7 +477,7 @@ def main() -> None:
                 disp = rel if len(rel) <= max_disp else "…" + rel[-(max_disp-1):]
                 sys.stdout.write(f"\r[ZIP] {prog:<18} {disp:<{max_disp}}")
                 sys.stdout.flush()
-        sys.stdout.write("\r[ZIP] Done. " + " " * (max_disp + 20) + "\n")
+        sys.stdout.write("\r[ZIP] Done. " + " " * (max_disp + 30) + "\n")
     print(f"ZIP file  : {zip_name}")
 
     # 실패 로그
