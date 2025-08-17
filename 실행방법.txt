@@ -1,5 +1,5 @@
 zap.bat -daemon -port 8090 -config api.key=SECRET -dir "C:\Users\WhiteHat\ZAP"
 
-python zap_spider_incremental_har.py --apikey SECRET --target https://securityhub.co.kr/ --base http://127.0.0.1:8090 --pscan-wait
+python zap_spider_incremental_har.py --target https://securityhub.co.kr/
 
 python zap_spider_incremental_har.py securityhub.co.kr.har

@@ -341,7 +341,7 @@ def main() -> None:
         return
 
     out_dir = in_har.with_name(in_har.stem + "_decoded")
-    zip_name = out_dir.with_suffix(".zip")
+    zip_name = in_har.with_name(in_har.stem + ".zip")
     out_dir.mkdir(exist_ok=True)
 
     # HAR 로딩
