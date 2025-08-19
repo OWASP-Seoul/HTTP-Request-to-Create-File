@@ -1,5 +1,7 @@
 zap.bat -daemon -port 8090 -config api.key=SECRET -dir "C:\Users\WhiteHat\ZAP"
 
-python zap_spider_incremental_har.py --target https://securityhub.co.kr/
+python zap_spider_incremental_har.py --target https://www.nipa.kr 
+python zap_spider_incremental_har.py --target https://www.nipa.kr --page-size 200 --tail-pages 100 --denom-refresh-sec 15 --panel scroll --har-format verbose --diag
+python zap_spider_incremental_har.py --target https://www.nipa.kr --scan-mode auto --page-size 200 --min-page-size 25 --pages-per-loop 20 --tail-pages 100 --denom-refresh-sec 15 --panel scroll --har-format verbose --diag
 
-python zap_spider_incremental_har.py securityhub.co.kr.har
+python zap_spider_incremental_har.py https://www.nipa.kr 
