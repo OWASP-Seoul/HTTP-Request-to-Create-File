@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ZAP Spider incremental HAR — clean session + spider stats + HAR title/format
-+ denom-refresh throttle + messagesIds auto-detect + clamped % + done-seen exit
-+ TIMESTAMPED LOGGING
-+ FORWARD SWEEP (auto) + RESILIENT messages paging
-
-- NEW: --scan-mode {auto,forward,tail} (default: auto)
-- NEW: --pages-per-loop N  → forward 모드에서 한 루프당 처리할 페이지 수 제한 (기본 10)
-- NEW: --min-page-size M   → messages 실패 시 M까지 절반 단위로 축소 재시도 (기본 25)
+ZAP Spider incremental HAR
+- Clean session (optional)
+- Spider stats (URLs Found, Nodes Added)
+- HAR progress with titles (compact/verbose)
+- Denominator refresh throttle (numberOfMessages)
+- messagesIds auto-detect with fallback to messages
+- Timestamped logging
+- Forward sweep + resilient paging
+- Early-exit when spider=100 and processed==seen
+- NEW: Snapshot save/load + Reseed + Segment options
+- NEW: Optional session rolling by denom threshold → snapshot & reseed
 
 2025-08-19
 """
@@ -19,9 +22,10 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional, Tuple, Set
 import urllib.parse
 import urllib.request
+from collections import deque
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Console/ANSI utilities
@@ -168,6 +172,18 @@ def spider_results_count(base, apikey, scan_id: int) -> Optional[int]:
     except Exception:
         return None
 
+def spider_results(base, apikey, scan_id: int) -> List[str]:
+    try:
+        res = _zap_json(base, "JSON/spider/view/results/", {"apikey": apikey, "scanId": str(scan_id)}).get("results", [])
+        if isinstance(res, list): return [str(u) for u in res]
+        if isinstance(res, dict):
+            for k in ("URLs","urls","Results","results"):
+                if k in res and isinstance(res[k], list):
+                    return [str(u) for u in res[k]]
+        return []
+    except Exception:
+        return []
+
 def spider_added_nodes_count(base, apikey, scan_id: int) -> Optional[int]:
     try:
         res = _zap_json(base, "JSON/spider/view/addedNodes/", {"apikey": apikey, "scanId": str(scan_id)}).get("addedNodes", [])
@@ -277,6 +293,10 @@ class DenomFetcher:
         self.refresh_sec = max(0.0, float(refresh_sec or 0.0))
         self._last_ts: float = 0.0; self._last_val: int = 0
 
+    def reset(self):
+        self._last_ts = 0.0
+        self._last_val = 0
+
     def get(self, force: bool = False) -> int:
         now = time.time()
         if not force and self.refresh_sec > 0 and (now - self._last_ts) < self.refresh_sec and self._last_val > 0:
@@ -290,15 +310,60 @@ class DenomFetcher:
             return self._last_val
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Snapshot / Reseed helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _host_of(url: str) -> Optional[str]:
+    try:
+        return urllib.parse.urlparse(url).hostname
+    except Exception:
+        return None
+
+def save_checkpoint(path: Path, target: str, discovered: Set[str], processed: Set[str]):
+    data = {
+        "version": 1,
+        "timestamp": int(time.time()),
+        "target": target,
+        "discovered_urls": sorted(discovered),
+        "processed_urls": sorted(processed),
+    }
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    tmp.replace(path)
+
+def load_checkpoint(path: Path) -> Tuple[str, Set[str], Set[str]]:
+    with path.open("r", encoding="utf-8") as f:
+        j = json.load(f)
+    target = j.get("target", "")
+    discovered = set(j.get("discovered_urls", []))
+    processed = set(j.get("processed_urls", []))
+    return target, discovered, processed
+
+def filter_seeds(candidates: List[str], target_host: str, same_host_only: bool) -> List[str]:
+    out = []
+    for u in candidates:
+        if not (u.startswith("http://") or u.startswith("https://")):
+            continue
+        if same_host_only:
+            h = _host_of(u)
+            if h and h.lower() != target_host.lower():
+                continue
+        out.append(u)
+    return out
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Main
 # ──────────────────────────────────────────────────────────────────────────────
 
 def main():
-    ap = argparse.ArgumentParser(description="ZAP Spider → incremental HAR exporter (clean session + spider stats + HAR title/format + denom throttle + timestamps + forward sweep)")
+    ap = argparse.ArgumentParser(description="ZAP Spider → incremental HAR exporter + snapshot/reseed/segment")
     ap.add_argument("--base", default="http://127.0.0.1:8090", help="ZAP base URL")
     ap.add_argument("--apikey", default="SECRET", help="ZAP apikey")
     ap.add_argument("--target", required=True, help="Target URL to spider")
     ap.add_argument("--out", default=None, help="Output HAR path (default: <host>.har)")
+
+    # Fetching / polling
     ap.add_argument("--page-size", type=int, default=200, help="Page size (IDs/messages fetch)")
     ap.add_argument("--min-page-size", type=int, default=25, help="Minimum page size for resilient fallback")
     ap.add_argument("--tail-pages", type=int, default=5, help="How many last pages to sweep (tail mode)")
@@ -307,6 +372,8 @@ def main():
     ap.add_argument("--refresh-sec", type=float, default=0.25, help="UI refresh interval")
     ap.add_argument("--panel", choices=["oneline","twoline","live","scroll"], default="twoline", help="Progress panel style")
     ap.add_argument("--color", choices=["auto","always","never"], default="auto", help="Color output")
+
+    # Spider behavior
     ap.add_argument("--pscan-clear-on-start", action="store_true", default=True, help="Clear passive scanner queue at start")
     ap.add_argument("--no-pscan-clear-on-start", action="store_false", dest="pscan_clear_on_start")
     ap.add_argument("--pscan-wait", action="store_true", help="Wait until passive scanner queue drains at the end")
@@ -319,15 +386,41 @@ def main():
     ap.add_argument("--ids-mode", choices=["ids","messages","auto"], default="auto",
                     help="Use lightweight IDs list, full messages, or auto-detect (default: auto)")
     ap.add_argument("--context-id", type=int, default=None); ap.add_argument("--user-id", type=int, default=None)
+
+    # Clean session controls
     ap.add_argument("--new-session", action="store_true", default=True, help="Start with a NEW ZAP session (clears history)")
     ap.add_argument("--no-new-session", action="store_false", dest="new_session")
     ap.add_argument("--session-name", default="auto_session", help="Name for the new session (used when --new-session)")
+
+    # Early-exit policy
     ap.add_argument("--exit-when-done-seen", action="store_true", default=True,
                     help="When spider=100% and processed+skipped==current history size, exit immediately (default on)")
     ap.add_argument("--no-exit-when-done-seen", action="store_false", dest="exit_when_done_seen")
+
+    # HAR display format
     ap.add_argument("--har-format", choices=["compact","verbose"], default="compact", help="HAR progress format")
+
+    # Denominator refresh throttle
     ap.add_argument("--denom-refresh-sec", type=float, default=0.0, help="Throttle numberOfMessages() polling")
+
+    # Diagnostics
     ap.add_argument("--diag", action="store_true", help="Print diagnostic counters per loop")
+
+    # NEW: Snapshot & Reseed
+    ap.add_argument("--checkpoint-file", default=None, help="Path to save/load snapshot (discovered/processed URLs)")
+    ap.add_argument("--checkpoint-interval-sec", type=int, default=60, help="How often to save snapshot (0=only on exit/roll)")
+    ap.add_argument("--reseed-from-checkpoint", action="store_true", help="On start, seed spider with outstanding URLs from checkpoint")
+    ap.add_argument("--reseed-limit", type=int, default=100, help="Max number of seed URLs to use per reseed wave/roll (0=unlimited)")
+    ap.add_argument("--reseed-same-host-only", action="store_true", default=True, help="Use only seeds on the same host as target")
+    ap.add_argument("--no-reseed-same-host-only", action="store_false", dest="reseed_same_host_only")
+    ap.add_argument("--reseed-subtree-only", action="store_true", default=True, help="Use subtreeOnly=true when reseeding")
+    ap.add_argument("--no-reseed-subtree-only", action="store_false", dest="reseed_subtree_only")
+    ap.add_argument("--seed-file", default=None, help="Optional file containing extra seed URLs (one per line)")
+
+    # NEW: Optional session rolling (by denom threshold)
+    ap.add_argument("--roll-denom-threshold", type=int, default=0, help="If >0, when seen>=threshold then start a new session and reseed")
+    ap.add_argument("--roll-interval-sec", type=int, default=900, help="Minimum seconds between rolls (default 15m)")
+
     args = ap.parse_args()
 
     # Output default
@@ -335,86 +428,61 @@ def main():
         parsed = urllib.parse.urlparse(args.target)
         host = parsed.hostname or "output"
         args.out = f"{host}.har"
-
-    color_on = (args.color == "always") or (args.color == "auto" and _ansi_ok())
-
-    # (1) New session
-    if args.new_session:
-        ok = new_session(args.base, args.apikey, name=args.session_name, overwrite=True)
-        print(colorize(stamp(f"[SESSION] new session {'created' if ok else 'failed'}: {args.session_name}"), COLOR.DIM if ok else COLOR.YELLOW, color_on))
-
-    # (2) Stop & remove any pre-existing spider scans
-    scans = spider_scans(args.base, args.apikey)
-    if scans:
-        spider_stop_all(args.base, args.apikey); spider_remove_all(args.base, args.apikey)
-        print(colorize(stamp(f"[SPIDER] previous scans cleared: {len(scans)}"), COLOR.DIM, color_on))
-    else:
-        print(colorize(stamp("[SPIDER] no previous scans"), COLOR.DIM, color_on))
-
-    # (3) Optional: clear Passive Scanner queue
-    if args.pscan_clear_on_start:
-        pscan_clear_queue(args.base, args.apikey)
-        remain = pscan_records_to_scan(args.base, args.apikey)
-        print(colorize(stamp(f"[PSCAN] queue cleared, remain={remain}"), COLOR.DIM, color_on))
-
-    # (4) Scope & options
-    print(colorize(stamp(f"[SCOPE] url={args.target}, recurse={not args.no_recurse}, subtreeOnly={args.subtree_only}"), COLOR.CYAN, color_on))
-    print(colorize(stamp(f"[SPIDER OPTIONS] MaxDepth=0, ThreadCount=16, MaxDuration=0, MaxChildren={args.max_children}, SendRefererHeader=true"), COLOR.CYAN, color_on))
-
-    # (5) Start spider
-    scan_id = spider_start(args.base, args.apikey, args.target, recurse=not args.no_recurse,
-                           subtreeOnly=args.subtree_only, maxChildren=args.max_children,
-                           contextId=args.context_id, userId=args.user_id, userAgent=args.user_agent)
-    print(colorize(stamp(f"[SPIDER] scanId={scan_id}"), COLOR.GREEN, color_on))
-
-    # (6) Resolve history filter baseurl
-    filter_base = args.filter_baseurl
-    if not filter_base:
-        parsed = urllib.parse.urlparse(args.target); host = parsed.hostname or ""
-        schemes = ["https","http"]; candidates = []
-        if args.history_filter in ("auto","host"):
-            for sch in schemes: candidates.append(f"{sch}://{host}/")
-        if args.history_filter in ("auto","target"):
-            base_target = f"{parsed.scheme}://{host}/"
-            if base_target not in candidates: candidates.append(base_target)
-        best, best_n = None, -1
-        for c in candidates:
-            try: n = number_of_messages(args.base, args.apikey, c)
-            except Exception: n = -1
-            if n > best_n: best, best_n = c, n
-        filter_base = None if args.history_filter == "none" else (best if best_n >= 0 else None)
-    print(colorize(stamp(f"[HISTORY] baseurl={'ALL' if not filter_base else filter_base} ({args.history_filter})"), COLOR.DIM, color_on))
-
-    # (7) Auto-detect messagesIds support when args.ids_mode=auto
-    ids_mode = args.ids_mode
-    if ids_mode == "auto":
-        if supports_messages_ids(args.base, args.apikey):
-            ids_mode = "ids"; print(colorize(stamp("[CAPS] messagesIds view: supported → using ids mode"), COLOR.DIM, color_on))
-        else:
-            ids_mode = "messages"; print(colorize(stamp("[CAPS] messagesIds view: unsupported → using messages mode"), COLOR.YELLOW, color_on))
-    else:
-        print(colorize(stamp(f"[CAPS] ids_mode={ids_mode}"), COLOR.DIM, color_on))
-
-    # Prepare work
-    processed_ids, skipped_ids = set(), set()
     ndjson_path = Path(args.out).with_suffix(".ndjson")
     if ndjson_path.exists(): ndjson_path.unlink()
 
-    # Denominator throttler
-    denom_fetcher = DenomFetcher(args.base, args.apikey, filter_base, refresh_sec=args.denom_refresh_sec)
-    last_seen_total = 0
-    last_diag_ts = 0.0
-    diag_interval = 5.0  # seconds
+    color_on = (args.color == "always") or (args.color == "auto" and _ansi_ok())
 
-    # Forward sweep state
-    forward_cursor = 0
-    forward_phase = (args.scan_mode in ("auto","forward"))
+    # Snapshot state
+    checkpoint_path = Path(args.checkpoint_file) if args.checkpoint_file else None
+    discovered_urls: Set[str] = set()
+    processed_urls: Set[str]  = set()
+    last_checkpoint_ts = 0.0
 
-    # Resilient fetcher
-    def fetch_ids_chunk(offs: int, size: int) -> Tuple[List[int], int]:
-        """Return (ids, used_size). On failure shrink size/2 until min-page-size; if all fail, return ([], 0)."""
+    def maybe_save_checkpoint(force: bool = False):
+        nonlocal last_checkpoint_ts
+        if not checkpoint_path: return
+        if args.checkpoint_interval_sec <= 0 and not force: return
+        now = time.time()
+        if force or (now - last_checkpoint_ts) >= args.checkpoint_interval_sec:
+            try:
+                save_checkpoint(checkpoint_path, args.target, discovered_urls, processed_urls)
+                last_checkpoint_ts = now
+                print(colorize(stamp(f"[CKPT] saved → {checkpoint_path} (disc={len(discovered_urls)}, proc={len(processed_urls)})"), COLOR.DIM, color_on))
+            except Exception as e:
+                print(colorize(stamp(f"[CKPT] save failed: {e}"), COLOR.YELLOW, color_on))
+
+    def load_seeds_from_checkpoint() -> List[str]:
+        if not checkpoint_path or not checkpoint_path.exists():
+            return []
+        try:
+            tgt, disc, proc = load_checkpoint(checkpoint_path)
+            discovered_urls.update(disc)
+            processed_urls.update(proc)
+            target_host = urllib.parse.urlparse(args.target).hostname or ""
+            outstanding = list(disc - proc)
+            seeds = filter_seeds(outstanding, target_host, args.reseed_same_host_only)
+            if args.reseed_limit > 0:
+                seeds = seeds[:args.reseed_limit]
+            print(colorize(stamp(f"[CKPT] loaded ← {checkpoint_path} (outstanding seeds={len(seeds)})"), COLOR.DIM, color_on))
+            return seeds
+        except Exception as e:
+            print(colorize(stamp(f"[CKPT] load failed: {e}"), COLOR.YELLOW, color_on))
+            return []
+
+    def load_seeds_from_file() -> List[str]:
+        if not args.seed_file: return []
+        p = Path(args.seed_file)
+        if not p.exists(): return []
+        lines = [ln.strip() for ln in p.read_text(encoding="utf-8", errors="replace").splitlines() if ln.strip()]
+        target_host = urllib.parse.urlparse(args.target).hostname or ""
+        seeds = filter_seeds(lines, target_host, args.reseed_same_host_only)
+        return seeds
+
+    # ── Fetcher utilities (resilient paging) ───────────────────────────────────
+
+    def fetch_ids_chunk(ids_mode: str, filter_base: Optional[str], offs: int, size: int) -> Tuple[List[int], int]:
         s = max(args.min_page_size, size)
-        tried = s
         while s >= args.min_page_size:
             try:
                 if ids_mode == "ids":
@@ -425,10 +493,11 @@ def main():
                 return ids, s
             except Exception:
                 s //= 2
-        return [], 0  # failed
+        return [], 0
 
-    def fetch_ids_range(total_now: int) -> Tuple[List[int], str]:
-        """Return (deduped ids, mode_label) according to scan mode/state."""
+    def fetch_ids_range(ids_mode: str, filter_base: Optional[str], total_now: int, forward_phase: bool,
+                        forward_cursor: int) -> Tuple[List[int], str, int]:
+        """Return (deduped ids, mode_label, new_forward_cursor)."""
         size = max(1, int(args.page_size))
         if forward_phase:
             ids: List[int] = []
@@ -437,130 +506,287 @@ def main():
             offs = forward_cursor
             count = 0
             while offs < end and count < pages:
-                chunk, used = fetch_ids_chunk(offs, size)
+                chunk, used = fetch_ids_chunk(ids_mode, filter_base, offs, size)
                 if not chunk and used == 0:
-                    # failed this offset; skip forward by min-page-size to avoid deadlock
                     offs += max(args.min_page_size, 1)
                     count += 1
                     continue
-                ids.extend(chunk)
-                offs += used
-                count += 1
-            # dedup preserve order
+                ids.extend(chunk); offs += used; count += 1
             seen_local = set(); dedup = []
             for i in ids:
                 if i not in seen_local: dedup.append(i); seen_local.add(i)
-            return dedup, "forward"
+            return dedup, "forward", offs
         else:
-            # tail mode
-            size = max(1, int(args.page_size))
             pages = max(1, int(args.tail_pages))
             start = max(0, total_now - size * pages)
             ids: List[int] = []
             offs = start
             while offs < total_now:
-                chunk, used = fetch_ids_chunk(offs, size)
+                chunk, used = fetch_ids_chunk(ids_mode, filter_base, offs, size)
                 if not chunk and used == 0:
-                    # skip this page to avoid stalling
                     offs += max(args.min_page_size, 1)
                     continue
-                ids.extend(chunk)
-                offs += used
+                ids.extend(chunk); offs += used
             seen_local = set(); dedup = []
             for i in ids:
                 if i not in seen_local: dedup.append(i); seen_local.add(i)
-            return dedup, "tail"
+            return dedup, "tail", forward_cursor
 
-    # polling
-    while True:
-        # Spider status
-        try: sp_pct = spider_status(args.base, args.apikey, scan_id)
-        except Exception: sp_pct = 0
+    # ── One scan runner (scan a single seed/target) ───────────────────────────
 
-        # Denominator BEFORE processing (throttled)
-        denom_before = denom_fetcher.get(force=(last_seen_total == 0))
-        denom_monotonic = max(last_seen_total, denom_before)
+    def run_one_scan(start_url: str,
+                     processed_ids: Set[int],
+                     skipped_ids: Set[int],
+                     ndjson_path: Path,
+                     filter_base: Optional[str],
+                     ids_mode: str,
+                     denom_fetcher: DenomFetcher,
+                     forward_mode_first: bool = True) -> Tuple[int, int, int]:
+        """
+        Run spider scan for start_url (subtreeOnly per args).
+        Returns tuple(processed_count_inc, skipped_count_inc, spider_scan_id_last).
+        """
+        # Start spider
+        scan_id = spider_start(
+            args.base, args.apikey, start_url,
+            recurse=not args.no_recurse, subtreeOnly=args.subtree_only or args.reseed_subtree_only,
+            maxChildren=args.max_children, contextId=args.context_id, userId=args.user_id,
+            userAgent=args.user_agent
+        )
+        print(colorize(stamp(f"[SPIDER] scanId={scan_id}  (seed: {start_url})"), COLOR.GREEN, color_on))
 
-        # Spider metrics
-        urls_found = spider_results_count(args.base, args.apikey, scan_id)
-        nodes_added = spider_added_nodes_count(args.base, args.apikey, scan_id)
+        # State for loop
+        last_seen_total = 0
+        forward_phase = (args.scan_mode in ("auto","forward")) and forward_mode_first
+        forward_cursor = 0
+        last_diag_ts = 0.0
+        diag_interval = 5.0
 
-        # Fetch and process IDs
-        ids, mode_label = fetch_ids_range(denom_monotonic)
-        new_ids = [i for i in ids if i not in processed_ids and i not in skipped_ids]
-        new_processed = new_skipped = 0
-        last_url = None
+        # Loop
+        while True:
+            try: sp_pct = spider_status(args.base, args.apikey, scan_id)
+            except Exception: sp_pct = 0
 
-        with ndjson_path.open("a", encoding="utf-8") as f_out:
-            for mid in ids:
-                if mid in processed_ids or mid in skipped_ids: continue
-                har = message_har_by_id(args.base, args.apikey, mid)
-                if not har:
-                    skipped_ids.add(mid); new_skipped += 1; continue
-                try:
-                    entries = har["log"]["entries"] if "log" in har else har["entries"]
-                except Exception:
-                    skipped_ids.add(mid); new_skipped += 1; continue
-                if not entries:
-                    skipped_ids.add(mid); new_skipped += 1; continue
-                if any(_is_2xx(e) for e in entries):
-                    f_out.write(json.dumps(har, ensure_ascii=False) + "\n")
-                    processed_ids.add(mid); new_processed += 1
-                    try: last_url = entries[0]["request"]["url"]
-                    except Exception: last_url = None
-                else:
-                    skipped_ids.add(mid); new_skipped += 1
+            # Update discovered URLs snapshot (for checkpoint)
+            try:
+                res_urls = spider_results(args.base, args.apikey, scan_id)
+                if res_urls:
+                    discovered_urls.update(res_urls)
+            except Exception:
+                pass
 
-        done_cnt = len(processed_ids) + len(skipped_ids)
+            # Denominator BEFORE
+            denom_before = denom_fetcher.get(force=(last_seen_total == 0))
+            denom_monotonic = max(last_seen_total, denom_before)
 
-        # Advance forward cursor if in forward phase
-        if forward_phase:
-            # cursor moves to the highest offset we attempted (monotonic)
-            forward_cursor = max(forward_cursor, denom_monotonic if not new_ids else max(new_ids)+1)
-            # switch to tail if we've caught up
-            if forward_cursor >= denom_monotonic:
+            # Spider metrics
+            urls_found = spider_results_count(args.base, args.apikey, scan_id)
+            nodes_added = spider_added_nodes_count(args.base, args.apikey, scan_id)
+
+            # Fetch & process HAR
+            ids, mode_label, forward_cursor = fetch_ids_range(ids_mode, filter_base, denom_monotonic, forward_phase, forward_cursor)
+            new_processed = 0; new_skipped = 0; last_url_har = None
+
+            with ndjson_path.open("a", encoding="utf-8") as f_out:
+                for mid in ids:
+                    if mid in processed_ids or mid in skipped_ids: continue
+                    har = message_har_by_id(args.base, args.apikey, mid)
+                    if not har:
+                        skipped_ids.add(mid); new_skipped += 1; continue
+                    try:
+                        entries = har["log"]["entries"] if "log" in har else har["entries"]
+                    except Exception:
+                        skipped_ids.add(mid); new_skipped += 1; continue
+                    if not entries:
+                        skipped_ids.add(mid); new_skipped += 1; continue
+                    if any(_is_2xx(e) for e in entries):
+                        f_out.write(json.dumps(har, ensure_ascii=False) + "\n")
+                        processed_ids.add(mid); new_processed += 1
+                        try:
+                            last_url_har = entries[0]["request"]["url"]
+                            if last_url_har:
+                                processed_urls.add(last_url_har)
+                        except Exception:
+                            last_url_har = None
+                    else:
+                        skipped_ids.add(mid); new_skipped += 1
+
+            done_cnt = len(processed_ids) + len(skipped_ids)
+
+            # Forward→Tail switch
+            if forward_phase and (forward_cursor >= denom_monotonic):
                 if args.scan_mode == "auto":
                     forward_phase = False
                     print(stamp("[MODE] switched to tail (caught up)"))
 
-        # Denominator AFTER processing (throttled)
-        denom_after = denom_fetcher.get(force=False)
-        denom_fresh = max(denom_monotonic, denom_after)
+            # Denominator AFTER
+            denom_after = denom_fetcher.get(force=False)
+            denom_fresh = max(denom_monotonic, denom_after)
 
-        # DIAG (throttled every 5s)
-        if args.diag and (time.time() - last_diag_ts >= diag_interval):
-            window = (args.page_size * (args.pages_per_loop if forward_phase else args.tail_pages))
-            mode_hint = f"{mode_label}, cursor={forward_cursor}" if forward_phase else mode_label
-            _println(colorize(stamp(f"[DIAG] mode={mode_hint}, fetched={len(ids)}, new={len(new_ids)}, window={window}, done={done_cnt}, denom={denom_fresh}"), COLOR.DIM, True))
-            last_diag_ts = time.time()
+            # DIAG (throttled)
+            now = time.time()
+            if args.diag and (now - last_diag_ts >= diag_interval):
+                window = (args.page_size * (args.pages_per_loop if forward_phase else args.tail_pages))
+                mode_hint = f"{mode_label}, cursor={forward_cursor}" if forward_phase else mode_label
+                _println(colorize(stamp(f"[DIAG] mode={mode_hint}, fetched={len(ids)}, done={done_cnt}, denom={denom_fresh}"), COLOR.DIM, True))
+                last_diag_ts = now
 
-        # Early-exit when spider=100% and we've processed what's visible
-        if sp_pct >= 100 and args.exit_when_done_seen and done_cnt >= denom_fresh:
+            # Checkpoint (periodic)
+            maybe_save_checkpoint(force=False)
+
+            # Early exit for this scan
+            if sp_pct >= 100 and args.exit_when_done_seen and done_cnt >= denom_fresh:
+                spider_seg = make_spider_segment(spider_pct=sp_pct, urls_found=urls_found, nodes_added=nodes_added)
+                har_seg   = make_har_segment(len(processed_ids), len(skipped_ids), denom_fresh, mode=args.har_format)
+                if _isatty() and args.panel == "oneline":
+                    _clear_oneline(); sys.stdout.write(stamp(f"{spider_seg} | {har_seg}")[:_term_width()] + "\r"); sys.stdout.flush()
+                break
+
+            # Render panel
             spider_seg = make_spider_segment(spider_pct=sp_pct, urls_found=urls_found, nodes_added=nodes_added)
-            har_seg = make_har_segment(len(processed_ids), len(skipped_ids), denom_fresh, mode=args.har_format)
-            if _isatty() and args.panel == "oneline":
-                _clear_oneline()
-                sys.stdout.write(stamp(f"{spider_seg} | {har_seg}")[:_term_width()] + "\r"); sys.stdout.flush()
-            break
+            har_seg   = make_har_segment(len(processed_ids), len(skipped_ids), denom_fresh, mode=args.har_format)
 
-        # Render panel
-        spider_seg = make_spider_segment(spider_pct=sp_pct, urls_found=urls_found, nodes_added=nodes_added)
-        har_seg   = make_har_segment(len(processed_ids), len(skipped_ids), denom_fresh, mode=args.har_format)
+            if args.panel == "oneline":
+                _clear_oneline(); sys.stdout.write(stamp(f"{spider_seg} | {har_seg}")[:_term_width()] + "\r"); sys.stdout.flush()
+            elif args.panel in ("twoline","live"):
+                if last_url_har: _println(colorize(stamp(f"[HAR+] {last_url_har}"), COLOR.WHITE, color_on))
+                _println(colorize(stamp(f"{spider_seg} | {har_seg}"), COLOR.CYAN, color_on))
+            elif args.panel == "scroll":
+                if last_url_har: print(colorize(stamp(f"[HAR+] {last_url_har}"), COLOR.WHITE, color_on))
+                print(colorize(stamp(f"{spider_seg} | {har_seg}"), COLOR.CYAN, color_on))
 
-        if args.panel == "oneline":
-            _clear_oneline(); sys.stdout.write(stamp(f"{spider_seg} | {har_seg}")[:_term_width()] + "\r"); sys.stdout.flush()
-        elif args.panel in ("twoline","live"):
-            if last_url: _println(colorize(stamp(f"[HAR+] {last_url}"), COLOR.WHITE, color_on))
-            _println(colorize(stamp(f"{spider_seg} | {har_seg}"), COLOR.CYAN, color_on))
-        elif args.panel == "scroll":
-            if last_url: print(colorize(stamp(f"[HAR+] {last_url}"), COLOR.WHITE, color_on))
-            print(colorize(stamp(f"{spider_seg} | {har_seg}"), COLOR.CYAN, color_on))
+            last_seen_total = denom_fresh
+            time.sleep(float(args.refresh_sec))
 
-        last_seen_total = denom_fresh
-        time.sleep(float(args.refresh_sec))
+        return new_processed, new_skipped, scan_id
+
+    # ── Session init / common setup ───────────────────────────────────────────
+
+    def init_session_and_common():
+        # New session if requested
+        if args.new_session:
+            ok = new_session(args.base, args.apikey, name=args.session_name, overwrite=True)
+            print(colorize(stamp(f"[SESSION] new session {'created' if ok else 'failed'}: {args.session_name}"), COLOR.DIM if ok else COLOR.YELLOW, color_on))
+
+        # Stop & remove any pre-existing spider scans
+        scans = spider_scans(args.base, args.apikey)
+        if scans:
+            spider_stop_all(args.base, args.apikey); spider_remove_all(args.base, args.apikey)
+            print(colorize(stamp(f"[SPIDER] previous scans cleared: {len(scans)}"), COLOR.DIM, color_on))
+        else:
+            print(colorize(stamp("[SPIDER] no previous scans"), COLOR.DIM, color_on))
+
+        # Optional: clear Passive Scanner queue
+        if args.pscan_clear_on_start:
+            pscan_clear_queue(args.base, args.apikey)
+            remain = pscan_records_to_scan(args.base, args.apikey)
+            print(colorize(stamp(f"[PSCAN] queue cleared, remain={remain}"), COLOR.DIM, color_on))
+
+        # Scope/opts
+        print(colorize(stamp(f"[SCOPE] url={args.target}, recurse={not args.no_recurse}, subtreeOnly={args.subtree_only}"), COLOR.CYAN, color_on))
+        print(colorize(stamp(f"[SPIDER OPTIONS] MaxDepth=0, ThreadCount=16, MaxDuration=0, MaxChildren={args.max_children}, SendRefererHeader=true"), COLOR.CYAN, color_on))
+
+    # ── Resolve history baseurl & ids_mode ────────────────────────────────────
+
+    def resolve_filter_baseurl() -> Optional[str]:
+        filter_base = args.filter_baseurl
+        if not filter_base:
+            parsed = urllib.parse.urlparse(args.target); host = parsed.hostname or ""
+            schemes = ["https","http"]; candidates = []
+            if args.history_filter in ("auto","host"):
+                for sch in schemes: candidates.append(f"{sch}://{host}/")
+            if args.history_filter in ("auto","target"):
+                base_target = f"{parsed.scheme}://{host}/"
+                if base_target not in candidates: candidates.append(base_target)
+            best, best_n = None, -1
+            for c in candidates:
+                try: n = number_of_messages(args.base, args.apikey, c)
+                except Exception: n = -1
+                if n > best_n: best, best_n = c, n
+            filter_base = None if args.history_filter == "none" else (best if best_n >= 0 else None)
+        print(colorize(stamp(f"[HISTORY] baseurl={'ALL' if not filter_base else filter_base} ({args.history_filter})"), COLOR.DIM, color_on))
+        return filter_base
+
+    def resolve_ids_mode() -> str:
+        ids_mode = args.ids_mode
+        if ids_mode == "auto":
+            if supports_messages_ids(args.base, args.apikey):
+                ids_mode = "ids"; print(colorize(stamp("[CAPS] messagesIds view: supported → using ids mode"), COLOR.DIM, color_on))
+            else:
+                ids_mode = "messages"; print(colorize(stamp("[CAPS] messagesIds view: unsupported → using messages mode"), COLOR.YELLOW, color_on))
+        else:
+            print(colorize(stamp(f"[CAPS] ids_mode={ids_mode}"), COLOR.DIM, color_on))
+        return ids_mode
+
+    # ── Main execution flow ───────────────────────────────────────────────────
+
+    # Initialize session and common
+    init_session_and_common()
+    filter_base = resolve_filter_baseurl()
+    ids_mode = resolve_ids_mode()
+    denom_fetcher = DenomFetcher(args.base, args.apikey, filter_base, refresh_sec=args.denom_refresh_sec)
+
+    # Seed queue (for reseed from checkpoint/file)
+    seed_queue: deque[str] = deque()
+    if args.reseed_from_checkpoint and args.checkpoint_file:
+        seed_queue.extend(load_seeds_from_checkpoint())
+    if args.seed_file:
+        seed_queue.extend(load_seeds_from_file())
+
+    # Global processed/skipped
+    processed_ids: Set[int] = set()
+    skipped_ids: Set[int] = set()
+
+    # If seed queue has items, run them first (segment crawl)
+    if seed_queue:
+        print(colorize(stamp(f"[RESEED] starting with {len(seed_queue)} seed(s)"), COLOR.CYAN, color_on))
+        while seed_queue:
+            seed = seed_queue.popleft()
+            _ = run_one_scan(seed, processed_ids, skipped_ids, ndjson_path, filter_base, ids_mode, denom_fetcher, forward_mode_first=True)
+            # after each seed scan, maybe save checkpoint
+            maybe_save_checkpoint(force=True)
+
+    # Now run main target scan
+    processed_inc, skipped_inc, last_scan_id = run_one_scan(args.target, processed_ids, skipped_ids, ndjson_path, filter_base, ids_mode, denom_fetcher, forward_mode_first=True)
+
+    # Optional: session rolling by denom threshold (simple one-shot wave)
+    if args.roll_denom_threshold and args.roll_denom_threshold > 0:
+        try:
+            current_seen = denom_fetcher.get(force=True)
+        except Exception:
+            current_seen = 0
+        last_roll_ts = time.time()
+        if current_seen >= args.roll_denom_threshold:
+            # snapshot save
+            maybe_save_checkpoint(force=True)
+            # pick outstanding seeds
+            target_host = urllib.parse.urlparse(args.target).hostname or ""
+            outstanding = list(discovered_urls - processed_urls)
+            seeds = filter_seeds(outstanding, target_host, args.reseed_same_host_only)
+            if args.reseed_limit > 0:
+                seeds = seeds[:args.reseed_limit]
+            print(colorize(stamp(f"[ROLL] threshold hit (seen={current_seen} ≥ {args.roll_denom_threshold}), restarting session; seeds={len(seeds)}"), COLOR.YELLOW, color_on))
+
+            # new session
+            args.new_session = True
+            init_session_and_common()
+            filter_base = resolve_filter_baseurl()
+            ids_mode = resolve_ids_mode()
+            denom_fetcher = DenomFetcher(args.base, args.apikey, filter_base, refresh_sec=args.denom_refresh_sec)
+
+            # run seeds wave
+            for s in seeds:
+                _ = run_one_scan(s, processed_ids, skipped_ids, ndjson_path, filter_base, ids_mode, denom_fetcher, forward_mode_first=True)
+                maybe_save_checkpoint(force=True)
+                if time.time() - last_roll_ts < args.roll_interval_sec:
+                    # optional pacing if 필요시
+                    pass
+
+            # (선택) 마지막으로 메인 타겟 한 번 더 훑기
+            _ = run_one_scan(args.target, processed_ids, skipped_ids, ndjson_path, filter_base, ids_mode, denom_fetcher, forward_mode_first=True)
 
     # finalize
-    finalize_har(Path(args.out).with_suffix(".ndjson"), Path(args.out), meta={"target": args.target, "filterBase": filter_base})
+    finalize_har(ndjson_path, Path(args.out), meta={"target": args.target, "filterBase": filter_base})
     print(colorize(stamp(f"[DONE] HAR saved → {args.out}  (entries: {len(processed_ids)}, skipped: {len(skipped_ids)})"), COLOR.GREEN, True))
 
 if __name__ == "__main__":
