@@ -8,12 +8,13 @@ ZAP Spider incremental HAR
 - Denominator refresh throttle (numberOfMessages)
 - messagesIds auto-detect with fallback to messages
 - Timestamped logging
-- Forward sweep + resilient paging (기존)
+- Forward sweep + resilient paging
 - Early-exit when spider=100 and processed==seen
 - Snapshot/Reseed/Segment + optional session rolling
-- NEW: Stream 모드(오프셋 0부터 순차 처리) + --stream-batch, --stream-start-offset
+- Stream mode (offset 0부터 순차 처리)
+- NEW: Bad host 패턴 자동 제외(스파이더 exclude regex) + HAR 루프 2차 방어 스킵
 
-2025-08-20
+2025-08-21
 """
 
 import argparse
@@ -228,6 +229,13 @@ def messages(base, apikey, baseurl: Optional[str], start: int, count: int) -> Li
     if baseurl: params["baseurl"] = baseurl
     return _zap_json(base, "JSON/core/view/messages/", params).get("messages", [])
 
+def spider_add_exclude_regex(base, apikey, regex: str):
+    try:
+        _zap_json(base, "JSON/spider/action/excludeFromScan/", {"apikey": apikey, "regex": regex})
+        print(stamp(f"[SPIDER] exclude regex added: {regex}"))
+    except Exception as e:
+        print(stamp(f"[SPIDER] exclude add failed: {e}"))
+
 # ──────────────────────────────────────────────────────────────────────────────
 # HAR helpers
 # ──────────────────────────────────────────────────────────────────────────────
@@ -357,7 +365,7 @@ def filter_seeds(candidates: List[str], target_host: str, same_host_only: bool) 
 # ──────────────────────────────────────────────────────────────────────────────
 
 def main():
-    ap = argparse.ArgumentParser(description="ZAP Spider → incremental HAR exporter + snapshot/reseed/segment + stream mode")
+    ap = argparse.ArgumentParser(description="ZAP Spider → incremental HAR exporter (+ snapshot/reseed/segment/stream + bad-host exclude)")
     ap.add_argument("--base", default="http://127.0.0.1:8090", help="ZAP base URL")
     ap.add_argument("--apikey", default="SECRET", help="ZAP apikey")
     ap.add_argument("--target", required=True, help="Target URL to spider")
@@ -424,6 +432,13 @@ def main():
     ap.add_argument("--roll-denom-threshold", type=int, default=0, help="If >0, when seen>=threshold then start a new session and reseed")
     ap.add_argument("--roll-interval-sec", type=int, default=900, help="Minimum seconds between rolls (default 15m)")
 
+    # NEW: bad host 자동 제외 토글 / 추가 정규식
+    ap.add_argument("--auto-exclude-bad-hosts", action="store_true", default=True,
+                    help="호스트에 '_' 포함 & '.' 없는 형태를 Spider에서 제외(기본 ON)")
+    ap.add_argument("--no-auto-exclude-bad-hosts", action="store_false", dest="auto_exclude_bad_hosts")
+    ap.add_argument("--extra-exclude-regex", action="append", default=[],
+                    help="추가로 Spider exclude regex를 등록(옵션 반복 가능)")
+
     args = ap.parse_args()
 
     # Output default
@@ -455,19 +470,14 @@ def main():
             except Exception as e:
                 print(colorize(stamp(f"[CKPT] save failed: {e}"), COLOR.YELLOW, color_on))
 
-    def load_checkpoint(path: Path) -> Tuple[str, Set[str], Set[str]]:
-        with path.open("r", encoding="utf-8") as f:
-            j = json.load(f)
-        target = j.get("target", "")
-        discovered = set(j.get("discovered_urls", []))
-        processed = set(j.get("processed_urls", []))
-        return target, discovered, processed
-
     def load_seeds_from_checkpoint() -> List[str]:
         if not checkpoint_path or not checkpoint_path.exists():
             return []
         try:
-            tgt, disc, proc = load_checkpoint(checkpoint_path)
+            with checkpoint_path.open("r", encoding="utf-8") as f:
+                j = json.load(f)
+            disc = set(j.get("discovered_urls", []))
+            proc = set(j.get("processed_urls", []))
             discovered_urls.update(disc)
             processed_urls.update(proc)
             target_host = urllib.parse.urlparse(args.target).hostname or ""
@@ -588,7 +598,7 @@ def main():
 
         # State for loop
         last_seen_total = 0
-        forward_phase = (args.scan_mode in ("auto","forward"))
+        forward_phase = (args.scan_mode in ("auto","forward")) and forward_mode_first
         tail_phase = (args.scan_mode == "tail")
         stream_phase = (args.scan_mode == "stream")
         forward_cursor = 0
@@ -633,12 +643,26 @@ def main():
                     har = message_har_by_id(args.base, args.apikey, mid)
                     if not har:
                         skipped_ids.add(mid); new_skipped += 1; continue
+
+                    # entries 추출
                     try:
                         entries = har["log"]["entries"] if "log" in har else har["entries"]
                     except Exception:
                         skipped_ids.add(mid); new_skipped += 1; continue
                     if not entries:
                         skipped_ids.add(mid); new_skipped += 1; continue
+
+                    # ── NEW: HAR 2차 방어 — 가짜 호스트 스킵 ────────────────────
+                    try:
+                        req_url = entries[0]["request"]["url"]
+                        host = urllib.parse.urlparse(req_url).hostname or ""
+                        # 호스트에 '_' 포함 && '.' 없음 → 가짜 호스트로 판단하여 스킵
+                        if "_" in host and "." not in host:
+                            skipped_ids.add(mid); new_skipped += 1; continue
+                    except Exception:
+                        pass
+                    # ───────────────────────────────────────────────────────────
+
                     if any(_is_2xx(e) for e in entries):
                         f_out.write(json.dumps(har, ensure_ascii=False) + "\n")
                         processed_ids.add(mid); new_processed += 1
@@ -712,10 +736,12 @@ def main():
     # ── Session init / common setup ───────────────────────────────────────────
 
     def init_session_and_common():
+        # 새 세션
         if args.new_session:
             ok = new_session(args.base, args.apikey, name=args.session_name, overwrite=True)
             print(colorize(stamp(f"[SESSION] new session {'created' if ok else 'failed'}: {args.session_name}"), COLOR.DIM if ok else COLOR.YELLOW, color_on))
 
+        # 기존 스파이더 스캔 제거
         scans = spider_scans(args.base, args.apikey)
         if scans:
             spider_stop_all(args.base, args.apikey); spider_remove_all(args.base, args.apikey)
@@ -723,13 +749,26 @@ def main():
         else:
             print(colorize(stamp("[SPIDER] no previous scans"), COLOR.DIM, color_on))
 
+        # 패시브 스캐너 큐 비움
         if args.pscan_clear_on_start:
             pscan_clear_queue(args.base, args.apikey)
             remain = pscan_records_to_scan(args.base, args.apikey)
             print(colorize(stamp(f"[PSCAN] queue cleared, remain={remain}"), COLOR.DIM, color_on))
 
+        # 스코프/옵션 출력
         print(colorize(stamp(f"[SCOPE] url={args.target}, recurse={not args.no_recurse}, subtreeOnly={args.subtree_only}"), COLOR.CYAN, color_on))
         print(colorize(stamp(f"[SPIDER OPTIONS] MaxDepth=0, ThreadCount=16, MaxDuration=0, MaxChildren={args.max_children}, SendRefererHeader=true"), COLOR.CYAN, color_on))
+
+        # ── NEW: 스파이더 exclude regex 자동 등록 ────────────────────────────
+        if args.auto_exclude_bad_hosts:
+            # (1) 호스트에 '_' 포함 + '.' 없는 형태 전부 제외
+            spider_add_exclude_regex(args.base, args.apikey, r"^https?://[^/]*_[^./]*(?:/|$)")
+            # (2) 선택: 특정 접두어(pc|mo|tab|m)_ 로 시작하는 변종(주석 해제 시 사용)
+            # spider_add_exclude_regex(args.base, args.apikey, r"^https?://(?:pc|mo|tab|m)_[^./]*(?:/|$)")
+        # 추가 정규식 사용자 지정
+        for rx in (args.extra_exclude_regex or []):
+            spider_add_exclude_regex(args.base, args.apikey, rx)
+        # ──────────────────────────────────────────────────────────────────────
 
     # ── Resolve history baseurl & ids_mode ────────────────────────────────────
 
@@ -770,7 +809,7 @@ def main():
     ids_mode = resolve_ids_mode()
     denom_fetcher = DenomFetcher(args.base, args.apikey, filter_base, refresh_sec=args.denom_refresh_sec)
 
-    # Seed queue (for reseed from checkpoint/file)
+    # reseed 준비
     seed_queue: deque[str] = deque()
     if args.reseed_from_checkpoint and args.checkpoint_file:
         seed_queue.extend(load_seeds_from_checkpoint())
